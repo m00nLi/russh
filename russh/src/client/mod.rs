@@ -255,8 +255,9 @@ pub enum Msg {
     SendGlobalRequest {
         name: String,
         data: CryptoVec,
-        /// Provide a channel for the reply result to request a reply from the server
-        reply_channel: Option<oneshot::Sender<Option<CryptoVec>>>,
+        want_reply: bool,
+        /// Reports local dispatch errors and, when requested, the remote reply.
+        response_channel: oneshot::Sender<Result<Option<CryptoVec>, crate::Error>>,
     },
 }
 
@@ -1127,39 +1128,29 @@ impl<H: Handler> Handle<H> {
     /// request name and the want-reply flag (see RFC 4254 section 4). When
     /// `want_reply` is true this waits for the peer's reply and returns its
     /// response-specific data, which may be empty. When it is false it returns
-    /// `Ok(None)` without waiting for a reply.
+    /// `Ok(None)` after the request is queued locally, without waiting for a
+    /// remote reply.
     pub async fn send_global_request<A: Into<String>>(
         &self,
         name: A,
         data: &[u8],
         want_reply: bool,
     ) -> Result<Option<CryptoVec>, Error> {
-        let (reply_channel, reply_recv) = if want_reply {
-            let (send, recv) = oneshot::channel();
-            (Some(send), Some(recv))
-        } else {
-            (None, None)
-        };
+        let (response_channel, response_recv) = oneshot::channel();
         self.sender
             .send(Msg::SendGlobalRequest {
                 name: name.into(),
                 data: CryptoVec::from_slice(data),
-                reply_channel,
+                want_reply,
+                response_channel,
             })
             .await
             .map_err(|_| Error::SendError)?;
 
-        match reply_recv {
-            Some(reply_recv) => match reply_recv.await {
-                Ok(Some(data)) => Ok(Some(data)),
-                Ok(None) => Err(Error::RequestDenied),
-                Err(e) => {
-                    error!("Unable to receive send_global_request result: {e:?}");
-                    Err(Error::Disconnect)
-                }
-            },
-            None => Ok(None),
-        }
+        response_recv.await.unwrap_or_else(|error| {
+            error!("Unable to receive send_global_request result: {error:?}");
+            Err(Error::Disconnect)
+        })
     }
 }
 
@@ -1819,9 +1810,10 @@ impl Session {
             Msg::SendGlobalRequest {
                 name,
                 data,
-                reply_channel,
+                want_reply,
+                response_channel,
             } => {
-                let _ = self.send_global_request(reply_channel, &name, &data);
+                self.send_global_request(response_channel, &name, &data, want_reply);
             }
             Msg::ServerChannelOpenReply { pending, result } => {
                 self.finalize_server_channel_open_reply(pending, result)?;
@@ -2192,6 +2184,31 @@ mod tests {
             reply_sender,
         );
         (session, sender, reply_receiver)
+    }
+
+    #[test]
+    fn global_request_without_encrypted_session_reports_inconsistent() {
+        let (mut session, _sender, _replies) = keyboard_interactive_session();
+        session.common.encrypted = None;
+
+        for want_reply in [false, true] {
+            let (response_channel, mut response) = oneshot::channel();
+            session.send_global_request(
+                response_channel,
+                "custom-request@example.com",
+                b"payload",
+                want_reply,
+            );
+
+            assert!(
+                matches!(
+                    response.try_recv(),
+                    Ok(Err(crate::Error::Inconsistent))
+                ),
+                "want_reply={want_reply}"
+            );
+            assert!(session.open_global_requests.is_empty());
+        }
     }
 
     const HOSTKEYS_SESSION_ID: &[u8] = b"hostkeys-session-id";

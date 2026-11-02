@@ -1030,7 +1030,7 @@ impl Session {
                         let _ = return_channel.send(result);
                     }
                     Some(GlobalRequestResponse::Other(return_channel)) => {
-                        let _ = return_channel.send(Some(CryptoVec::from_slice(r)));
+                        let _ = return_channel.send(Ok(Some(CryptoVec::from_slice(r))));
                     }
                     None => {
                         error!("Received global request failure for unknown request!")
@@ -1067,7 +1067,7 @@ impl Session {
                         let _ = return_channel.send(Err(crate::Error::RequestDenied));
                     }
                     Some(GlobalRequestResponse::Other(return_channel)) => {
-                        let _ = return_channel.send(None);
+                        let _ = return_channel.send(Err(crate::Error::RequestDenied));
                     }
                     None => {
                         error!("Received global request failure for unknown request!")

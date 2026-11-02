@@ -1,6 +1,7 @@
 use log::error;
 use ssh_encoding::Encode;
 use tokio::sync::oneshot;
+use zeroize::Zeroize;
 
 use crate::client::Session;
 use crate::session::EncryptedState;
@@ -415,29 +416,47 @@ impl Session {
     /// Sends a global request with a custom name to the server.
     ///
     /// `data` is appended verbatim after the request name and want-reply flag.
-    /// If `reply_channel` is not None, sets want_reply and returns the server's
-    /// response-specific data via the channel, [`Some`] on success or [`None`]
-    /// on failure.
+    /// Reports local packet-construction errors through `response_channel`.
+    /// When `want_reply` is set, that channel remains queued for the remote
+    /// success payload or request rejection.
     pub fn send_global_request(
         &mut self,
-        reply_channel: Option<oneshot::Sender<Option<CryptoVec>>>,
+        response_channel: oneshot::Sender<Result<Option<CryptoVec>, crate::Error>>,
         name: &str,
         data: &[u8],
-    ) -> Result<(), crate::Error> {
-        if let Some(ref mut enc) = self.common.encrypted {
-            let want_reply = reply_channel.is_some();
-            if let Some(reply_channel) = reply_channel {
-                self.open_global_requests
-                    .push_back(crate::session::GlobalRequestResponse::Other(reply_channel));
-            }
-            push_packet!(enc.write, {
+        want_reply: bool,
+    ) {
+        let Some(ref mut enc) = self.common.encrypted else {
+            let _ = response_channel.send(Err(crate::Error::Inconsistent));
+            return;
+        };
+
+        let write_start = enc.write.len();
+        let result = push_packet!(
+            enc.write,
+            (|| {
                 msg::GLOBAL_REQUEST.encode(&mut enc.write)?;
                 name.encode(&mut enc.write)?;
                 (want_reply as u8).encode(&mut enc.write)?;
                 enc.write.extend_from_slice(data);
-            });
+                Ok::<(), crate::Error>(())
+            })()
+        );
+        if let Err(error) = result {
+            if let Some(pending) = enc.write.get_mut(write_start..) {
+                pending.zeroize();
+            }
+            enc.write.truncate(write_start);
+            let _ = response_channel.send(Err(error));
+            return;
         }
-        Ok(())
+
+        if want_reply {
+            self.open_global_requests
+                .push_back(crate::session::GlobalRequestResponse::Other(response_channel));
+        } else {
+            let _ = response_channel.send(Ok(None));
+        }
     }
 
     pub fn send_keepalive(&mut self, want_reply: bool) -> Result<(), crate::Error> {
